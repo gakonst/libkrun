@@ -1992,6 +1992,7 @@ const KRUN_FEATURE_INTEL_TDX: u64 = 8;
 const KRUN_FEATURE_AWS_NITRO: u64 = 9;
 const KRUN_FEATURE_VIRGL_RESOURCE_MAP2: u64 = 10;
 const KRUN_FEATURE_VFIO: u64 = 12;
+const KRUN_FEATURE_TEE_AUTHENTICATED_ROOT: u64 = 13;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn krun_has_feature(feature: u64) -> c_int {
@@ -2010,6 +2011,7 @@ pub extern "C" fn krun_has_feature(feature: u64) -> c_int {
             target_os = "linux",
             target_arch = "x86_64"
         )),
+        KRUN_FEATURE_TEE_AUTHENTICATED_ROOT => cfg!(feature = "tee"),
         _ => return -libc::EINVAL,
     };
 

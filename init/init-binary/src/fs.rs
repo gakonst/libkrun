@@ -103,21 +103,36 @@ pub fn mount_tmpfs(path: &str) -> anyhow::Result<()> {
     .with_context(|| format!("mount tmpfs at {path}"))
 }
 
-/// Mount /dev/vda as ext4, then pivot root into it.
+/// Mount the TEE root as ext4, then pivot root into it.
 #[cfg(any(feature = "amd-sev", feature = "tdx"))]
 pub fn mount_tee_block_device() -> anyhow::Result<()> {
-    fs::create_dir_all("/tmp/vda").context("create /tmp/vda")?;
+    let configured = match env::var("KRUN_TEE_AUTHENTICATED_ROOT") {
+        Ok(source) => Some(source),
+        Err(env::VarError::NotUnicode(_)) => bail!("KRUN_TEE_AUTHENTICATED_ROOT is not UTF-8"),
+        Err(env::VarError::NotPresent) => None,
+    };
+    let (source, flags) = tee_root_mount(configured)?;
+    fs::create_dir_all("/tmp/tee-root").context("create /tmp/tee-root")?;
 
-    mount_or_busy(
-        Some("/dev/vda"),
-        "/tmp/vda",
-        Some("ext4"),
-        MsFlags::MS_RELATIME,
-    )?;
-    unistd::chdir("/tmp/vda").context("chdir /tmp/vda")?;
+    mount_or_busy(Some(&source), "/tmp/tee-root", Some("ext4"), flags)?;
+    unistd::chdir("/tmp/tee-root").context("chdir /tmp/tee-root")?;
 
     mount_or_busy(Some("."), "/", None::<&str>, MsFlags::MS_MOVE)?;
     unistd::chroot(".").context("chroot .")
+}
+
+#[cfg(any(feature = "amd-sev", feature = "tdx"))]
+fn tee_root_mount(configured: Option<String>) -> anyhow::Result<(String, MsFlags)> {
+    const AUTHENTICATED_ROOT: &str = "/dev/dm-0";
+
+    match configured {
+        Some(source) if source == AUTHENTICATED_ROOT => Ok((
+            source,
+            MsFlags::MS_RDONLY | MsFlags::MS_NODEV | MsFlags::MS_NOSUID | MsFlags::MS_RELATIME,
+        )),
+        Some(_) => bail!("KRUN_TEE_AUTHENTICATED_ROOT must be /dev/dm-0"),
+        None => Ok(("/dev/vda".to_string(), MsFlags::MS_RELATIME)),
+    }
 }
 
 /// Mount source onto target, trying each non-virtual filesystem listed in
@@ -190,4 +205,32 @@ pub fn mount_shared_root() -> anyhow::Result<()> {
         None::<&str>,
     )
     .context("set MS_SHARED on root mount")
+}
+
+#[cfg(all(test, any(feature = "amd-sev", feature = "tdx")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authenticated_tee_root_is_exact_and_read_only() {
+        let (source, flags) = tee_root_mount(Some("/dev/dm-0".to_string())).unwrap();
+
+        assert_eq!(source, "/dev/dm-0");
+        assert!(flags.contains(MsFlags::MS_RDONLY));
+        assert!(flags.contains(MsFlags::MS_NODEV));
+        assert!(flags.contains(MsFlags::MS_NOSUID));
+    }
+
+    #[test]
+    fn authenticated_tee_root_rejects_any_other_device() {
+        assert!(tee_root_mount(Some("/dev/vda".to_string())).is_err());
+    }
+
+    #[test]
+    fn absent_authenticated_root_preserves_existing_tee_behavior() {
+        assert_eq!(
+            tee_root_mount(None).unwrap(),
+            ("/dev/vda".to_string(), MsFlags::MS_RELATIME)
+        );
+    }
 }
