@@ -3,12 +3,12 @@
 // found in the LICENSE file.
 
 use std::fs::File;
-use std::io::{Error, ErrorKind, Result};
+use std::io::{Error, ErrorKind, IoSlice, IoSliceMut, Result};
 use std::os::unix::io::AsRawFd;
 
 #[cfg(feature = "blk")]
 use imago::io_buffers::{IoVector, IoVectorMut};
-use vm_memory::VolatileSlice;
+use vm_memory::{VolatileSlice, bitmap::Bitmap};
 
 use libc::{c_int, c_void, read, readv, size_t, write, writev};
 
@@ -427,12 +427,29 @@ impl FileReadWriteAtVolatile for DiskProperties {
             return Ok(0);
         }
 
-        let (iovec, _guard) = IoVectorMut::from_volatile_slice(bufs);
+        let guards = bufs
+            .iter()
+            .map(VolatileSlice::ptr_guard_mut)
+            .collect::<Vec<_>>();
+        let slices = guards
+            .iter()
+            .map(|guard| {
+                // SAFETY: The vm-memory guard keeps this mapped for the lifetime of `iovec`.
+                // VolatileSlice permits aliasing, and all access remains inside this I/O call.
+                unsafe { std::slice::from_raw_parts_mut(guard.as_ptr(), guard.len()) }
+            })
+            .map(IoSliceMut::new)
+            .collect::<Vec<_>>();
+        let iovec = IoVectorMut::from(slices);
         let full_length = iovec
             .len()
             .try_into()
             .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
-        self.file.lock().unwrap().readv(iovec, offset)?;
+        let result = self.file.lock().unwrap().readv(iovec, offset);
+        for buf in bufs {
+            buf.bitmap().mark_dirty(0, buf.len());
+        }
+        result?;
         Ok(full_length)
     }
 
@@ -445,7 +462,19 @@ impl FileReadWriteAtVolatile for DiskProperties {
             return Ok(0);
         }
 
-        let (iovec, _guard) = IoVector::from_volatile_slice(bufs);
+        let guards = bufs
+            .iter()
+            .map(VolatileSlice::ptr_guard)
+            .collect::<Vec<_>>();
+        let slices = guards
+            .iter()
+            .map(|guard| {
+                // SAFETY: The vm-memory guard keeps this mapped for the lifetime of `iovec`.
+                unsafe { std::slice::from_raw_parts(guard.as_ptr(), guard.len()) }
+            })
+            .map(IoSlice::new)
+            .collect::<Vec<_>>();
+        let iovec = IoVector::from(slices);
         let full_length = iovec
             .len()
             .try_into()
