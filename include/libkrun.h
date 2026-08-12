@@ -884,6 +884,25 @@ int32_t krun_set_tee_config_file(uint32_t ctx_id, const char *filepath);
 int32_t krun_set_tee_type(uint32_t ctx_id, uint32_t tee_type);
 
 /**
+ * Sets the opaque HOST_DATA value included in SNP_LAUNCH_FINISH. Only
+ * available in the AMD SEV variant. The value is copied by libkrun and may be
+ * released by the caller after this function returns.
+ *
+ * Arguments:
+ *  "ctx_id"         - the configuration context ID.
+ *  "host_data"      - exactly 32 bytes of caller-owned data.
+ *  "host_data_len"  - the size of host_data; must be 32.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ *  -EINVAL - host_data is null or host_data_len is not 32.
+ *  -ENOENT - ctx_id does not exist.
+ */
+int32_t krun_set_snp_host_data(uint32_t ctx_id,
+                               const uint8_t *host_data,
+                               size_t host_data_len);
+
+/**
  * Sets the host Quote Generation Service Unix socket used to service the TDX
  * TDG.VP.VMCALL<GetQuote> interface. Only available in the TDX variant.
  *

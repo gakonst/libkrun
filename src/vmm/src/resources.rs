@@ -246,6 +246,9 @@ pub struct VmResources {
     /// TEE configuration
     #[cfg(feature = "tee")]
     pub tee_config: TeeConfig,
+    /// Opaque host-supplied data included in SNP_LAUNCH_FINISH.
+    #[cfg(feature = "amd-sev")]
+    snp_host_data: [u8; 32],
     /// Intel QGS Unix socket used for TDX GetQuote requests.
     #[cfg(feature = "tdx")]
     pub tdx_quote_generation_socket: Option<PathBuf>,
@@ -470,6 +473,16 @@ impl VmResources {
         self.tee_config.tee = tee.into();
     }
 
+    #[cfg(feature = "amd-sev")]
+    pub fn set_snp_host_data(&mut self, host_data: [u8; 32]) {
+        self.snp_host_data = host_data;
+    }
+
+    #[cfg(feature = "amd-sev")]
+    pub fn snp_host_data(&self) -> [u8; 32] {
+        self.snp_host_data
+    }
+
     #[cfg(feature = "tdx")]
     pub fn set_tdx_quote_generation_socket(&mut self, socket: PathBuf) {
         self.tdx_quote_generation_socket = Some(socket);
@@ -544,6 +557,8 @@ mod tests {
             net: Default::default(),
             #[cfg(feature = "tee")]
             tee_config: Default::default(),
+            #[cfg(feature = "amd-sev")]
+            snp_host_data: [0; 32],
             #[cfg(feature = "tdx")]
             tdx_quote_generation_socket: None,
             gpu_virgl_flags: None,
@@ -636,6 +651,17 @@ mod tests {
 
         vm_resources.set_tee_type(TeeType::Tdx);
         assert_eq!(vm_resources.tee_config().tee, Tee::Tdx);
+    }
+
+    #[cfg(feature = "amd-sev")]
+    #[test]
+    fn test_set_snp_host_data() {
+        let mut vm_resources = default_vm_resources();
+        let host_data = [0x5a; 32];
+
+        assert_eq!(vm_resources.snp_host_data(), [0; 32]);
+        vm_resources.set_snp_host_data(host_data);
+        assert_eq!(vm_resources.snp_host_data(), host_data);
     }
 
     #[test]
