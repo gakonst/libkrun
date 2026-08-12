@@ -754,8 +754,8 @@ int32_t krun_set_smbios_oem_strings(uint32_t ctx_id, const char *const oem_strin
 /**
  * Sets the working directory for the executable to be run inside the microVM.
  *
- * Only available in aws-nitro builds. Non-nitro builds return -ENOTSUP;
- * use libkrun_init's Config::apply() with .krun_config.json instead.
+ * Available in aws-nitro and TEE builds. Other builds return -ENOTSUP and
+ * should use libkrun_init's Config::apply() with .krun_config.json instead.
  *
  * Arguments:
  *  "ctx_id"        - the configuration context ID.
@@ -763,7 +763,7 @@ int32_t krun_set_smbios_oem_strings(uint32_t ctx_id, const char *const oem_strin
  *
  * Returns:
  *  Zero on success or a negative error number on failure.
- *  -ENOTSUP - not available in this build (non-nitro)
+ *  -ENOTSUP - not available in this build
  */
 int32_t krun_set_workdir(uint32_t ctx_id,
                          const char *workdir_path);
@@ -773,8 +773,8 @@ int32_t krun_set_workdir(uint32_t ctx_id,
  * to be passed to the executable, and the environment variables to be
  * configured in the context of the executable.
  *
- * Only available in aws-nitro builds. Non-nitro builds return -ENOTSUP;
- * use libkrun_init's Config::apply() with .krun_config.json instead.
+ * Available in aws-nitro and TEE builds. Other builds return -ENOTSUP and
+ * should use libkrun_init's Config::apply() with .krun_config.json instead.
  *
  * Arguments:
  *  "ctx_id"    - the configuration context ID.
@@ -786,7 +786,7 @@ int32_t krun_set_workdir(uint32_t ctx_id,
  *
  * Returns:
  *  Zero on success or a negative error number on failure.
- *  -ENOTSUP - not available in this build (non-nitro)
+ *  -ENOTSUP - not available in this build
  */
 int32_t krun_set_exec(uint32_t ctx_id,
                       const char *exec_path,

@@ -182,12 +182,26 @@ struct NitroConfig {
     console_output: Option<PathBuf>,
 }
 
+/// Process configuration delivered to the measured TEE init through the
+/// kernel command line. TEE guests cannot use libkrun_init's virtiofs overlay
+/// because their root is an authenticated block device.
+#[cfg(all(feature = "tee", not(feature = "aws-nitro")))]
+#[derive(Default)]
+struct TeeProcessConfig {
+    workdir: Option<String>,
+    exec_path: Option<String>,
+    env: Option<String>,
+    args: Option<String>,
+}
+
 #[derive(Default)]
 struct ContextConfig {
     krunfw: KrunfwBindingsResult,
     vmr: VmResources,
     #[cfg(feature = "aws-nitro")]
     nitro: NitroConfig,
+    #[cfg(all(feature = "tee", not(feature = "aws-nitro")))]
+    tee_process: TeeProcessConfig,
     net_index: u8,
     tsi_port_map: Option<HashMap<u16, u16>>,
     vsock_config: VsockConfig,
@@ -234,6 +248,30 @@ impl NitroConfig {
 }
 
 impl ContextConfig {
+    #[cfg(all(feature = "tee", not(feature = "aws-nitro")))]
+    fn tee_process_kernel_env(&self) -> String {
+        let exec_path = self
+            .tee_process
+            .exec_path
+            .as_deref()
+            .map(|path| format!("KRUN_INIT={path}"))
+            .unwrap_or_default();
+        let workdir = self
+            .tee_process
+            .workdir
+            .as_deref()
+            .map(|path| format!("KRUN_WORKDIR={path}"))
+            .unwrap_or_default();
+        let env = self.tee_process.env.as_deref().unwrap_or_default();
+
+        format!("{exec_path} {workdir} {env}")
+    }
+
+    #[cfg(all(feature = "tee", not(feature = "aws-nitro")))]
+    fn tee_process_args(&self) -> &str {
+        self.tee_process.args.as_deref().unwrap_or_default()
+    }
+
     #[cfg(all(feature = "blk", not(feature = "tee")))]
     fn set_block_root(&mut self, device: String, fstype: Option<String>, options: Option<String>) {
         self.block_root = Some(BlockRootConfig {
@@ -1137,13 +1175,33 @@ pub unsafe extern "C" fn krun_set_rlimits(ctx_id: u32, c_rlimits: *const *const 
 
 /// Set the working directory for the process to be run inside the VM.
 ///
-/// Only available in aws-nitro builds. Non-nitro builds return `-ENOTSUP`;
-/// use Config::apply() with .krun_config.json instead.
+/// Available in aws-nitro and TEE builds. Other builds return `-ENOTSUP` and
+/// should use Config::apply() with .krun_config.json instead.
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
-#[cfg(not(feature = "aws-nitro"))]
+#[cfg(not(any(feature = "aws-nitro", feature = "tee")))]
 pub unsafe extern "C" fn krun_set_workdir(_ctx_id: u32, _c_workdir_path: *const c_char) -> i32 {
     -libc::ENOTSUP
+}
+
+/// Set the working directory for the process run by a TEE guest's measured
+/// init.
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+#[cfg(all(feature = "tee", not(feature = "aws-nitro")))]
+pub unsafe extern "C" fn krun_set_workdir(ctx_id: u32, c_workdir_path: *const c_char) -> i32 {
+    if c_workdir_path.is_null() {
+        return -libc::EINVAL;
+    }
+    let workdir = match unsafe { CStr::from_ptr(c_workdir_path) }.to_str() {
+        Ok(workdir) => workdir.to_string(),
+        Err(_) => return -libc::EINVAL,
+    };
+
+    with_cfg(ctx_id, |cfg| {
+        cfg.tee_process.workdir = Some(workdir);
+        KRUN_SUCCESS
+    })
 }
 
 /// Set the working directory for the process to be run inside the VM.
@@ -1174,32 +1232,31 @@ pub unsafe extern "C" fn krun_set_workdir(ctx_id: u32, c_workdir_path: *const c_
     }
 }
 
-#[cfg(feature = "aws-nitro")]
-unsafe fn collapse_str_array(array: &[*const c_char]) -> Result<String, std::str::Utf8Error> {
-    unsafe {
-        let mut strvec = Vec::new();
+#[cfg(any(feature = "aws-nitro", feature = "tee"))]
+unsafe fn collapse_str_array(array: *const *const c_char) -> Result<String, std::str::Utf8Error> {
+    let mut strvec = Vec::new();
 
-        for item in array.iter().take(MAX_ARGS) {
-            if item.is_null() {
-                break;
-            } else {
-                let s = CStr::from_ptr(*item).to_str()?;
-                strvec.push(format!("\"{s}\""));
-            }
+    for index in 0..MAX_ARGS {
+        let item = unsafe { *array.add(index) };
+        if item.is_null() {
+            break;
+        } else {
+            let s = unsafe { CStr::from_ptr(item) }.to_str()?;
+            strvec.push(format!("\"{s}\""));
         }
-
-        Ok(strvec.join(" "))
     }
+
+    Ok(strvec.join(" "))
 }
 
 /// Set the executable to be run inside the VM, together with its arguments
 /// and environment variables.
 ///
-/// Only available in aws-nitro builds. Non-nitro builds return `-ENOTSUP`;
-/// use Config::apply() with .krun_config.json instead.
+/// Available in aws-nitro and TEE builds. Other builds return `-ENOTSUP` and
+/// should use Config::apply() with .krun_config.json instead.
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
-#[cfg(not(feature = "aws-nitro"))]
+#[cfg(not(any(feature = "aws-nitro", feature = "tee")))]
 pub unsafe extern "C" fn krun_set_exec(
     _ctx_id: u32,
     _c_exec_path: *const c_char,
@@ -1207,6 +1264,51 @@ pub unsafe extern "C" fn krun_set_exec(
     _c_envp: *const *const c_char,
 ) -> i32 {
     -libc::ENOTSUP
+}
+
+/// Set the executable, arguments, and environment delivered to a TEE guest's
+/// measured init through the kernel command line.
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+#[cfg(all(feature = "tee", not(feature = "aws-nitro")))]
+pub unsafe extern "C" fn krun_set_exec(
+    ctx_id: u32,
+    c_exec_path: *const c_char,
+    c_argv: *const *const c_char,
+    c_envp: *const *const c_char,
+) -> i32 {
+    if c_exec_path.is_null() {
+        return -libc::EINVAL;
+    }
+    let exec_path = match unsafe { CStr::from_ptr(c_exec_path) }.to_str() {
+        Ok(path) => path.to_string(),
+        Err(_) => return -libc::EINVAL,
+    };
+    let args = if c_argv.is_null() {
+        String::new()
+    } else {
+        match unsafe { collapse_str_array(c_argv) } {
+            Ok(args) => args,
+            Err(_) => return -libc::EINVAL,
+        }
+    };
+    let env = if c_envp.is_null() {
+        std::env::vars()
+            .map(|(key, value)| format!(" {key}=\"{value}\""))
+            .collect()
+    } else {
+        match unsafe { collapse_str_array(c_envp) } {
+            Ok(env) => env,
+            Err(_) => return -libc::EINVAL,
+        }
+    };
+
+    with_cfg(ctx_id, |cfg| {
+        cfg.tee_process.exec_path = Some(exec_path);
+        cfg.tee_process.args = Some(args);
+        cfg.tee_process.env = Some(env);
+        KRUN_SUCCESS
+    })
 }
 
 /// Set the executable to be run inside the VM, together with its arguments
@@ -1234,8 +1336,7 @@ pub unsafe extern "C" fn krun_set_exec(
         };
 
         let args = if !c_argv.is_null() {
-            let argv_array: &[*const c_char] = slice::from_raw_parts(c_argv, MAX_ARGS);
-            match collapse_str_array(argv_array) {
+            match collapse_str_array(c_argv) {
                 Ok(s) => s,
                 Err(e) => {
                     debug!("Error parsing args: {e:?}");
@@ -1247,8 +1348,7 @@ pub unsafe extern "C" fn krun_set_exec(
         };
 
         let env = if !c_envp.is_null() {
-            let envp_array: &[*const c_char] = slice::from_raw_parts(c_envp, MAX_ARGS);
-            match collapse_str_array(envp_array) {
+            match collapse_str_array(c_envp) {
                 Ok(s) => s,
                 Err(e) => {
                     debug!("Error parsing args: {e:?}");
@@ -1297,8 +1397,7 @@ pub unsafe extern "C" fn krun_set_env(_ctx_id: u32, _c_envp: *const *const c_cha
 pub unsafe extern "C" fn krun_set_env(ctx_id: u32, c_envp: *const *const c_char) -> i32 {
     unsafe {
         let env = if !c_envp.is_null() {
-            let envp_array: &[*const c_char] = slice::from_raw_parts(c_envp, MAX_ARGS);
-            match collapse_str_array(envp_array) {
+            match collapse_str_array(c_envp) {
                 Ok(s) => s,
                 Err(e) => {
                     debug!("Error parsing args: {e:?}");
@@ -3093,7 +3192,17 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     }
     let kernel_cmdline = KernelCmdlineConfig {
         prolog: Some(prolog),
+        #[cfg(all(feature = "tee", not(feature = "aws-nitro")))]
+        krun_env: Some(format!(
+            " {} {}",
+            ctx_cfg.tee_process_kernel_env(),
+            ctx_cfg.get_block_root()
+        )),
+        #[cfg(not(all(feature = "tee", not(feature = "aws-nitro"))))]
         krun_env: Some(format!(" {}", ctx_cfg.get_block_root())),
+        #[cfg(all(feature = "tee", not(feature = "aws-nitro")))]
+        epilog: Some(format!(" -- {}", ctx_cfg.tee_process_args())),
+        #[cfg(not(all(feature = "tee", not(feature = "aws-nitro"))))]
         epilog: None,
     };
 
@@ -3309,6 +3418,43 @@ mod tee_tests {
                 .snp_host_data(),
             host_data
         );
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[cfg(not(feature = "aws-nitro"))]
+    #[test]
+    fn tee_process_configuration_is_validated_and_retained() {
+        let ctx_id = krun_create_ctx();
+        assert!(ctx_id >= 0);
+        let ctx_id = ctx_id as u32;
+        let arg_ptrs = [c"/".as_ptr(), std::ptr::null()];
+        let env_ptrs = [c"TERM=dumb".as_ptr(), std::ptr::null()];
+
+        assert_eq!(
+            unsafe {
+                krun_set_exec(
+                    ctx_id,
+                    c"/nanocodex-vm-guest".as_ptr(),
+                    arg_ptrs.as_ptr(),
+                    env_ptrs.as_ptr(),
+                )
+            },
+            KRUN_SUCCESS
+        );
+        assert_eq!(
+            unsafe { krun_set_workdir(ctx_id, c"/".as_ptr()) },
+            KRUN_SUCCESS
+        );
+
+        let contexts = CTX_MAP.lock().unwrap();
+        let cfg = contexts.get(&ctx_id).unwrap();
+        assert_eq!(
+            cfg.tee_process_kernel_env(),
+            "KRUN_INIT=/nanocodex-vm-guest KRUN_WORKDIR=/ \"TERM=dumb\""
+        );
+        assert_eq!(cfg.tee_process_args(), "\"/\"");
+        drop(contexts);
 
         assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
     }
