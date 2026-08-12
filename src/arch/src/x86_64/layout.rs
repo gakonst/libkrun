@@ -14,8 +14,8 @@ pub const BOOT_STACK_POINTER: u64 = 0x8ff0;
 pub const CMDLINE_START: u64 = 0x20000;
 /// Kernel command line start address maximum size.
 pub const CMDLINE_MAX_SIZE: usize = 0x10000;
-/// Kernel command line static size on SEV.
-pub const CMDLINE_SEV_SIZE: usize = 0x200;
+/// Maximum command line accepted by the confidential x86_64 kernels.
+pub const TEE_CMDLINE_MAX_SIZE: usize = 0x800;
 /// Initrd start address on SEV.
 pub const INITRD_SEV_START: u64 = 0xa00000;
 

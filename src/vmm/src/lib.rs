@@ -379,11 +379,7 @@ impl Vmm {
     ) -> Result<()> {
         #[cfg(target_arch = "x86_64")]
         {
-            let cmdline_len = if cfg!(feature = "tee") {
-                arch::x86_64::layout::CMDLINE_SEV_SIZE
-            } else {
-                self.kernel_cmdline.len() + 1
-            };
+            let cmdline_len = self.kernel_cmdline.len() + 1;
 
             arch::x86_64::configure_system(
                 &self.guest_memory,

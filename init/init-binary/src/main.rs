@@ -61,8 +61,15 @@ fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "freebsd")]
     freebsd::populate_env_from_kenv();
 
-    #[cfg(any(feature = "amd-sev", feature = "tdx"))]
-    fs::mount_tee_block_device()?;
+    #[cfg(all(target_os = "linux", any(feature = "amd-sev", feature = "tdx")))]
+    {
+        // Establish the virtio console before the authenticated-root mount so
+        // a fail-closed TEE boot reports its error to the host instead of
+        // disappearing into the initramfs console.
+        fs::mount_filesystems()?;
+        exec::setup_redirects();
+        fs::mount_tee_block_device()?;
+    }
 
     #[cfg(target_os = "linux")]
     {

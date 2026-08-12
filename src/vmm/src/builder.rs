@@ -612,17 +612,21 @@ pub fn build_microvm(
 
     // Clone the command-line so that a failed boot doesn't pollute the original.
     #[allow(unused_mut)]
-    let mut kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
+    #[cfg(all(target_arch = "x86_64", feature = "tee"))]
+    let cmdline_capacity = arch::x86_64::layout::TEE_CMDLINE_MAX_SIZE;
+    #[cfg(not(all(target_arch = "x86_64", feature = "tee")))]
+    let cmdline_capacity = arch::CMDLINE_MAX_SIZE;
+    let mut kernel_cmdline = Cmdline::new(cmdline_capacity);
     if let Some(cmdline) = payload_config.kernel_cmdline {
-        kernel_cmdline.insert_str(cmdline.as_str()).unwrap();
+        kernel_cmdline.insert_str(cmdline.as_str())?;
     } else if let Some(cmdline) = &vm_resources.kernel_cmdline.prolog {
-        kernel_cmdline.insert_str(cmdline).unwrap();
+        kernel_cmdline.insert_str(cmdline)?;
     } else {
-        kernel_cmdline.insert_str(DEFAULT_KERNEL_CMDLINE).unwrap();
+        kernel_cmdline.insert_str(DEFAULT_KERNEL_CMDLINE)?;
     }
 
     if let Some(cmdline) = &vm_resources.kernel_cmdline.krun_env {
-        kernel_cmdline.insert_str(cmdline.as_str()).unwrap();
+        kernel_cmdline.insert_str(cmdline.as_str())?;
     }
 
     if let Some(kernel_console) = &vm_resources.kernel_console {
@@ -636,8 +640,8 @@ pub fn build_microvm(
             &cmdline[console_start_idx..console_end_idx.unwrap()],
             format!("console={kernel_console}").as_str(),
         );
-        kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
-        kernel_cmdline.insert_str(cmdline).unwrap();
+        kernel_cmdline = Cmdline::new(cmdline_capacity);
+        kernel_cmdline.insert_str(cmdline)?;
     }
 
     #[cfg(not(feature = "tee"))]
@@ -725,6 +729,13 @@ pub fn build_microvm(
                 guest_addr: arch::x86_64::layout::ZERO_PAGE_START,
                 host_addr: guest_memory
                     .get_host_address(GuestAddress(arch::x86_64::layout::ZERO_PAGE_START))
+                    .unwrap() as u64,
+                size: 4096,
+            },
+            MeasuredRegion {
+                guest_addr: arch::x86_64::layout::CMDLINE_START,
+                host_addr: guest_memory
+                    .get_host_address(GuestAddress(arch::x86_64::layout::CMDLINE_START))
                     .unwrap() as u64,
                 size: 4096,
             },
@@ -1177,12 +1188,12 @@ pub fn build_microvm(
     }
 
     if let Some(s) = &vm_resources.kernel_cmdline.epilog {
-        vmm.kernel_cmdline.insert_str(s).unwrap();
+        vmm.kernel_cmdline.insert_str(s)?;
     };
 
     // Write the kernel command line to guest memory. This is x86_64 specific, since on
     // aarch64 the command line will be specified through the FDT.
-    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+    #[cfg(target_arch = "x86_64")]
     load_cmdline(&vmm)?;
 
     vmm.configure_system(
@@ -1817,7 +1828,7 @@ pub fn create_guest_memory(
     Ok((guest_mem, arch_mem_info, shm_manager, payload_config))
 }
 
-#[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+#[cfg(target_arch = "x86_64")]
 fn load_cmdline(vmm: &Vmm) -> std::result::Result<(), StartMicrovmError> {
     kernel::loader::load_cmdline(
         vmm.guest_memory(),
