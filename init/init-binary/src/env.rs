@@ -103,6 +103,9 @@ fn setup_dhcp(iface: &str, sock: i32) {
 /// `--` delimiter. Mirrors `tsi_enabled()` in init.c.
 #[cfg(target_os = "linux")]
 pub fn tsi_enabled() -> bool {
+    if std::env::var("KRUN_TSI_HIJACK").as_deref() == Ok("1") {
+        return true;
+    }
     let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") else {
         return false;
     };

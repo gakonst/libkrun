@@ -106,12 +106,7 @@ pub fn mount_tmpfs(path: &str) -> anyhow::Result<()> {
 /// Mount the TEE root as ext4, then pivot root into it.
 #[cfg(any(feature = "amd-sev", feature = "tdx"))]
 pub fn mount_tee_block_device() -> anyhow::Result<()> {
-    let configured = match env::var("KRUN_TEE_AUTHENTICATED_ROOT") {
-        Ok(source) => Some(source),
-        Err(env::VarError::NotUnicode(_)) => bail!("KRUN_TEE_AUTHENTICATED_ROOT is not UTF-8"),
-        Err(env::VarError::NotPresent) => None,
-    };
-    let (source, flags) = tee_root_mount(configured)?;
+    let (source, flags) = tee_root_mount();
     fs::create_dir_all("/tmp/tee-root").context("create /tmp/tee-root")?;
 
     mount_or_busy(Some(&source), "/tmp/tee-root", Some("ext4"), flags)?;
@@ -122,17 +117,11 @@ pub fn mount_tee_block_device() -> anyhow::Result<()> {
 }
 
 #[cfg(any(feature = "amd-sev", feature = "tdx"))]
-fn tee_root_mount(configured: Option<String>) -> anyhow::Result<(String, MsFlags)> {
-    const AUTHENTICATED_ROOT: &str = "/dev/dm-0";
-
-    match configured {
-        Some(source) if source == AUTHENTICATED_ROOT => Ok((
-            source,
-            MsFlags::MS_RDONLY | MsFlags::MS_NODEV | MsFlags::MS_NOSUID | MsFlags::MS_RELATIME,
-        )),
-        Some(_) => bail!("KRUN_TEE_AUTHENTICATED_ROOT must be /dev/dm-0"),
-        None => Ok(("/dev/vda".to_string(), MsFlags::MS_RELATIME)),
-    }
+fn tee_root_mount() -> (String, MsFlags) {
+    (
+        "/dev/dm-0".to_string(),
+        MsFlags::MS_RDONLY | MsFlags::MS_NODEV | MsFlags::MS_NOSUID | MsFlags::MS_RELATIME,
+    )
 }
 
 /// Mount source onto target, trying each non-virtual filesystem listed in
@@ -213,24 +202,11 @@ mod tests {
 
     #[test]
     fn authenticated_tee_root_is_exact_and_read_only() {
-        let (source, flags) = tee_root_mount(Some("/dev/dm-0".to_string())).unwrap();
+        let (source, flags) = tee_root_mount();
 
         assert_eq!(source, "/dev/dm-0");
         assert!(flags.contains(MsFlags::MS_RDONLY));
         assert!(flags.contains(MsFlags::MS_NODEV));
         assert!(flags.contains(MsFlags::MS_NOSUID));
-    }
-
-    #[test]
-    fn authenticated_tee_root_rejects_any_other_device() {
-        assert!(tee_root_mount(Some("/dev/vda".to_string())).is_err());
-    }
-
-    #[test]
-    fn absent_authenticated_root_preserves_existing_tee_behavior() {
-        assert_eq!(
-            tee_root_mount(None).unwrap(),
-            ("/dev/vda".to_string(), MsFlags::MS_RELATIME)
-        );
     }
 }

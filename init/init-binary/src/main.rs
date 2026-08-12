@@ -1,4 +1,6 @@
 mod config;
+#[cfg(all(target_os = "linux", any(feature = "amd-sev", feature = "tdx")))]
+mod device_mapper;
 #[cfg(target_os = "linux")]
 mod dhcp;
 mod env;
@@ -7,6 +9,8 @@ mod exec;
 mod freebsd;
 #[cfg(target_os = "linux")]
 mod fs;
+#[cfg(all(target_os = "linux", any(feature = "amd-sev", feature = "tdx")))]
+mod launch_secret;
 #[cfg(feature = "timesync")]
 mod timesync;
 
@@ -61,8 +65,20 @@ fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "freebsd")]
     freebsd::populate_env_from_kenv();
 
-    #[cfg(any(feature = "amd-sev", feature = "tdx"))]
-    fs::mount_tee_block_device()?;
+    #[cfg(all(target_os = "linux", any(feature = "amd-sev", feature = "tdx")))]
+    let process_args = {
+        // Make fail-closed early-boot errors visible before authenticating and
+        // pivoting into the external root.
+        fs::mount_filesystems()?;
+        exec::setup_redirects();
+        let launch = launch_secret::read_and_apply()?;
+        device_mapper::create_verity_mapping(&launch.verity)?;
+        fs::mount_tee_block_device()?;
+        launch.process_args
+    };
+
+    #[cfg(not(all(target_os = "linux", any(feature = "amd-sev", feature = "tdx"))))]
+    let process_args: Vec<String> = std::env::args().skip(1).collect();
 
     #[cfg(target_os = "linux")]
     {
@@ -125,19 +141,14 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(125);
     }
 
-    // The kernel places everything after `--` in the cmdline as this
-    // process's argv[1..].  The C init built exec_argv by replacing argv[0]
-    // with KRUN_INIT (or /bin/sh) and keeping argv[1..] in every branch.
-    let proc_args: Vec<String> = std::env::args().collect();
-
     let argv: Vec<String> = if let Ok(init) = std::env::var("KRUN_INIT") {
-        // KRUN_INIT holds the binary; kernel cmdline args are the arguments.
+        // KRUN_INIT holds the binary; launch args are its arguments.
         let mut v = vec![init];
-        v.extend_from_slice(proc_args.get(1..).unwrap_or_default());
+        v.extend(process_args);
         v
     } else if let Some(v) = cfg.argv {
         v
-    } else if proc_args.len() > 1 {
+    } else if !process_args.is_empty() {
         // No KRUN_INIT and no config: treat proc_args[1..] as the command.
         //
         // Intentional divergence from the C init: the C init substituted
@@ -150,7 +161,7 @@ fn main() -> anyhow::Result<()> {
         // typical krun caller that omits both KRUN_INIT and a config file
         // intends the cmdline argument to be the command, not a shell script,
         // so this behaviour is more useful and less surprising.
-        proc_args.into_iter().skip(1).collect()
+        process_args
     } else {
         vec!["/bin/sh".to_string()]
     };

@@ -9,6 +9,10 @@ use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::path::Path;
 use std::process;
+#[cfg(target_os = "linux")]
+use std::thread;
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 use nix::fcntl::{self, OFlag};
@@ -30,36 +34,47 @@ const VIRTIOFS_MAGIC: libc::c_long = 0x6573_5546;
 
 #[cfg(target_os = "linux")]
 pub fn setup_redirects() {
-    let Ok(ports_dir) = fs::read_dir("/sys/class/virtio-ports") else {
-        eprintln!("Unable to open virtio-ports directory");
-        process::exit(125);
-    };
-    for entry in ports_dir.flatten() {
-        let name_path = entry.path().join("name");
-        let Ok(port_name) = fs::read_to_string(&name_path) else {
-            continue;
-        };
-        let (fd, oflag) = match port_name.trim_end_matches('\n') {
-            "krun-stdin" => (libc::STDIN_FILENO, OFlag::O_RDONLY),
-            "krun-stdout" => (libc::STDOUT_FILENO, OFlag::O_WRONLY),
-            "krun-stderr" => (libc::STDERR_FILENO, OFlag::O_WRONLY),
-            _ => continue,
-        };
-        let dev_path = format!("/dev/{}", entry.file_name().to_string_lossy());
-        let Ok(new_fd) = fcntl::open(Path::new(&dev_path), oflag, Mode::empty()) else {
-            continue;
-        };
-        if new_fd.as_raw_fd() == fd {
-            // Device opened directly onto the target fd (happens when
-            // the target was already closed); prevent OwnedFd from closing it.
-            mem::forget(new_fd);
-            continue;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut redirected = 0;
+        if let Ok(ports_dir) = fs::read_dir("/sys/class/virtio-ports") {
+            for entry in ports_dir.flatten() {
+                let name_path = entry.path().join("name");
+                let Ok(port_name) = fs::read_to_string(&name_path) else {
+                    continue;
+                };
+                let (fd, oflag) = match port_name.trim_end_matches('\n') {
+                    "krun-stdin" => (libc::STDIN_FILENO, OFlag::O_RDONLY),
+                    "krun-stdout" => (libc::STDOUT_FILENO, OFlag::O_WRONLY),
+                    "krun-stderr" => (libc::STDERR_FILENO, OFlag::O_WRONLY),
+                    _ => continue,
+                };
+                let dev_path = format!("/dev/{}", entry.file_name().to_string_lossy());
+                let Ok(new_fd) = fcntl::open(Path::new(&dev_path), oflag, Mode::empty()) else {
+                    continue;
+                };
+                if new_fd.as_raw_fd() == fd {
+                    // Device opened directly onto the target fd (happens when
+                    // the target was already closed); prevent OwnedFd from closing it.
+                    mem::forget(new_fd);
+                } else {
+                    let _ = match fd {
+                        libc::STDIN_FILENO => unistd::dup2_stdin(&new_fd),
+                        libc::STDOUT_FILENO => unistd::dup2_stdout(&new_fd),
+                        _ => unistd::dup2_stderr(&new_fd),
+                    };
+                }
+                redirected += 1;
+            }
         }
-        let _ = match fd {
-            libc::STDIN_FILENO => unistd::dup2_stdin(&new_fd),
-            libc::STDOUT_FILENO => unistd::dup2_stdout(&new_fd),
-            _ => unistd::dup2_stderr(&new_fd),
-        };
+        if redirected == 3 {
+            return;
+        }
+        if Instant::now() >= deadline {
+            eprintln!("Unable to attach all krun virtio console ports");
+            process::exit(125);
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 

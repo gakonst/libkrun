@@ -254,13 +254,13 @@ impl ContextConfig {
             .tee_process
             .exec_path
             .as_deref()
-            .map(|path| format!("KRUN_INIT={path}"))
+            .map(|path| format!("KRUN_INIT={}", quote_cmdline_token(path)))
             .unwrap_or_default();
         let workdir = self
             .tee_process
             .workdir
             .as_deref()
-            .map(|path| format!("KRUN_WORKDIR={path}"))
+            .map(|path| format!("KRUN_WORKDIR={}", quote_cmdline_token(path)))
             .unwrap_or_default();
         let env = self.tee_process.env.as_deref().unwrap_or_default();
 
@@ -369,6 +369,20 @@ impl ContextConfig {
     fn set_vmm_gid(&mut self, vmm_gid: libc::gid_t) {
         self.vmm_gid = Some(vmm_gid);
     }
+}
+
+#[cfg(any(feature = "aws-nitro", feature = "tee"))]
+fn quote_cmdline_token(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for character in value.chars() {
+        if character == '\\' || character == '"' {
+            quoted.push('\\');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    quoted
 }
 
 #[cfg(feature = "aws-nitro")]
@@ -1242,11 +1256,42 @@ unsafe fn collapse_str_array(array: *const *const c_char) -> Result<String, std:
             break;
         } else {
             let s = unsafe { CStr::from_ptr(item) }.to_str()?;
-            strvec.push(format!("\"{s}\""));
+            strvec.push(quote_cmdline_token(s));
         }
     }
 
     Ok(strvec.join(" "))
+}
+
+#[cfg(all(feature = "tee", not(feature = "aws-nitro")))]
+unsafe fn tee_env_array_has_reserved_control(
+    array: *const *const c_char,
+) -> Result<bool, std::str::Utf8Error> {
+    for index in 0..MAX_ARGS {
+        let item = unsafe { *array.add(index) };
+        if item.is_null() {
+            break;
+        }
+        let value = unsafe { CStr::from_ptr(item) }.to_str()?;
+        if tee_environment_control_name(value).is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(all(feature = "tee", not(feature = "aws-nitro")))]
+fn tee_environment_control_name(value: &str) -> Option<&str> {
+    let (name, _) = value.split_once('=')?;
+    is_tee_environment_control(name).then_some(name)
+}
+
+#[cfg(all(feature = "tee", not(feature = "aws-nitro")))]
+fn is_tee_environment_control(name: &str) -> bool {
+    matches!(
+        name,
+        "KRUN_INIT" | "KRUN_WORKDIR" | "KRUN_TEE_VERITY" | "KRUN_TEE_AUTHENTICATED_ROOT"
+    )
 }
 
 /// Set the executable to be run inside the VM, together with its arguments
@@ -1293,10 +1338,23 @@ pub unsafe extern "C" fn krun_set_exec(
         }
     };
     let env = if c_envp.is_null() {
-        std::env::vars()
-            .map(|(key, value)| format!(" {key}=\"{value}\""))
-            .collect()
+        let inherited: Vec<_> = std::env::vars().collect();
+        if inherited
+            .iter()
+            .any(|(key, _)| is_tee_environment_control(key))
+        {
+            return -libc::EINVAL;
+        }
+        inherited
+            .into_iter()
+            .map(|(key, value)| quote_cmdline_token(&format!("{key}={value}")))
+            .collect::<Vec<_>>()
+            .join(" ")
     } else {
+        match unsafe { tee_env_array_has_reserved_control(c_envp) } {
+            Ok(true) | Err(_) => return -libc::EINVAL,
+            Ok(false) => {}
+        }
         match unsafe { collapse_str_array(c_envp) } {
             Ok(env) => env,
             Err(_) => return -libc::EINVAL,
@@ -3451,10 +3509,77 @@ mod tee_tests {
         let cfg = contexts.get(&ctx_id).unwrap();
         assert_eq!(
             cfg.tee_process_kernel_env(),
-            "KRUN_INIT=/nanocodex-vm-guest KRUN_WORKDIR=/ \"TERM=dumb\""
+            "KRUN_INIT=\"/nanocodex-vm-guest\" KRUN_WORKDIR=\"/\" \"TERM=dumb\""
         );
         assert_eq!(cfg.tee_process_args(), "\"/\"");
         drop(contexts);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[cfg(not(feature = "aws-nitro"))]
+    #[test]
+    fn tee_process_configuration_escapes_cmdline_syntax() {
+        let ctx_id = krun_create_ctx() as u32;
+        let arg_ptrs = [c"path with \\ and \"quote\"".as_ptr(), std::ptr::null()];
+        let env_ptrs = [c"VALUE=a\\b\"c".as_ptr(), std::ptr::null()];
+
+        assert_eq!(
+            unsafe {
+                krun_set_exec(
+                    ctx_id,
+                    c"/guest path".as_ptr(),
+                    arg_ptrs.as_ptr(),
+                    env_ptrs.as_ptr(),
+                )
+            },
+            KRUN_SUCCESS
+        );
+        assert_eq!(
+            unsafe { krun_set_workdir(ctx_id, c"/work path".as_ptr()) },
+            KRUN_SUCCESS
+        );
+
+        let contexts = CTX_MAP.lock().unwrap();
+        let cfg = contexts.get(&ctx_id).unwrap();
+        assert_eq!(
+            cfg.tee_process_kernel_env(),
+            "KRUN_INIT=\"/guest path\" KRUN_WORKDIR=\"/work path\" \"VALUE=a\\\\b\\\"c\""
+        );
+        assert_eq!(
+            cfg.tee_process_args(),
+            "\"path with \\\\ and \\\"quote\\\"\""
+        );
+        drop(contexts);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[cfg(not(feature = "aws-nitro"))]
+    #[test]
+    fn tee_process_environment_cannot_override_launch_controls() {
+        let ctx_id = krun_create_ctx() as u32;
+        let controls = [
+            c"KRUN_INIT=/bin/sh",
+            c"KRUN_WORKDIR=/tmp",
+            c"KRUN_TEE_VERITY=untrusted",
+            c"KRUN_TEE_AUTHENTICATED_ROOT=/dev/vda",
+        ];
+
+        for control in controls {
+            let env_ptrs = [control.as_ptr(), std::ptr::null()];
+            assert_eq!(
+                unsafe {
+                    krun_set_exec(
+                        ctx_id,
+                        c"/guest".as_ptr(),
+                        std::ptr::null(),
+                        env_ptrs.as_ptr(),
+                    )
+                },
+                -libc::EINVAL
+            );
+        }
 
         assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
     }
