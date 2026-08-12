@@ -30,7 +30,7 @@ pub enum Error {
     OpenFirmware(std::io::Error),
 }
 
-const COUNT_MAX: usize = 80;
+const COUNT_MAX: usize = 64;
 
 fn as_u32_le(array: &[u8; 4]) -> u32 {
     (array[0] as u32)
@@ -196,6 +196,18 @@ impl AmdSnp {
                 snp_cpuid_entry.ebx = 51 | (1 << 6);
                 snp_cpuid_entry.ecx = 0;
                 snp_cpuid_entry.edx = 0;
+            }
+
+            // The SNP firmware ABI limits the CPUID page to 64 entries and
+            // explicitly permits sparse tables. Missing in-range leaves are
+            // interpreted as all-zero by the guest, so retaining them only
+            // risks overflowing the measured table as KVM adds new leaves.
+            if snp_cpuid_entry.eax == 0
+                && snp_cpuid_entry.ebx == 0
+                && snp_cpuid_entry.ecx == 0
+                && snp_cpuid_entry.edx == 0
+            {
+                continue;
             }
 
             if cpuid_entry.count as usize >= COUNT_MAX {
